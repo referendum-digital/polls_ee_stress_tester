@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -93,9 +96,9 @@ func (d *VoteDispatcher) spawnWorker(ctx context.Context) {
 
 func (d *VoteDispatcher) Stop() {
 	d.cancelFunc()
-	// wait for workers to finish
+
 	d.waitGroup.Wait()
-	// close the log channel to signal collectors
+
 	close(d.LogChan)
 }
 
@@ -107,7 +110,6 @@ func (d *VoteDispatcher) Start() {
 }
 
 func sendRequest(ctx context.Context, url string, seed []byte, body m, headers map[string]string) (map[string]any, error) {
-	// Create a new HTTP request
 	jsonBytes, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -119,12 +121,20 @@ func sendRequest(ctx context.Context, url string, seed []byte, body m, headers m
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	tsStr := strconv.FormatInt(time.Now().Unix(), 10)
+
 	ed25519PrivateKey := ed25519.NewKeyFromSeed(seed)
 
-	signature := ed25519.Sign(ed25519PrivateKey, jsonBytes)
+	signatureMessage := []byte(tsStr)
+	signatureMessage = append(signatureMessage, jsonBytes...)
 
-	req.Header.Set("sig", hex.EncodeToString(signature))
+	signature := ed25519.Sign(ed25519PrivateKey, signatureMessage)
+
+	req.Header.Set("ts", tsStr)
+	req.Header.Set("sig", base64.StdEncoding.EncodeToString(signature))
 	req.Header.Set("pk", hex.EncodeToString(ed25519PrivateKey.Public().(ed25519.PublicKey)))
+
+	log.Printf("Ts: %s MS %v", tsStr)
 
 	if headers != nil {
 		for k, v := range headers {
@@ -132,10 +142,8 @@ func sendRequest(ctx context.Context, url string, seed []byte, body m, headers m
 		}
 	}
 
-	// Set up the HTTP client with a timeout
 	client := &http.Client{Timeout: 60 * time.Second}
 
-	// Execute the request
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -148,26 +156,21 @@ func sendRequest(ctx context.Context, url string, seed []byte, body m, headers m
 	}
 
 	var result map[string]any
-	// try to unmarshal response body if possible
 	if len(bodyBytes) > 0 {
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			// if the body is not JSON, still return a helpful error on non-2xx
 			if resp.StatusCode != 200 && resp.StatusCode != 201 {
 				return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes))
 			}
-			// for 2xx with non-json body, return empty map
 			result = map[string]any{"raw": string(bodyBytes)}
 		}
 	} else {
 		result = map[string]any{}
 	}
 
-	// Success codes: return parsed result
 	if resp.StatusCode == 200 || resp.StatusCode == 201 {
 		return result, nil
 	}
 
-	// Non-success: include body in error
 	return nil, fmt.Errorf("non success status code %d: %s", resp.StatusCode, string(bodyBytes))
 }
 
@@ -189,8 +192,8 @@ func main() {
 
 	ctx := context.Background()
 
-	totalVotes := 100_000
-	blockchainWritingsTotal := 200
+	totalVotes := 100
+	blockchainWritingsTotal := 1
 
 	targetValue := totalVotes / blockchainWritingsTotal
 
@@ -223,6 +226,9 @@ func main() {
 		},
 	}
 	newPoll, err := sendRequest(ctx, fmt.Sprintf("%s/poll", baseURl), signingKey, pollDto, nil)
+
+	log.Printf("New poll :%v", newPoll)
+
 	if err != nil {
 		log.Fatalf("failed to send request: %v", err)
 	}
@@ -260,8 +266,47 @@ func main() {
 	case <-finishedChan:
 		// stop dispatcher (waits for workers and closes channels)
 		voteDispatcher.Stop()
-		for _, logObj := range logs {
-			log.Printf("Vote dispatcher finished with %v", logObj)
+		// Aggregate metrics and print summary statistics
+		var totalUserNs int64
+		var totalVoteNs int64
+		var successCount int
+		var failureCount int
+		userTimes := make([]int64, 0, len(logs))
+		voteTimes := make([]int64, 0, len(logs))
+
+		for _, l := range logs {
+			if l.UserRequestSuccess {
+				successCount++
+			} else {
+				failureCount++
+			}
+			totalUserNs += l.UserRequestTimeNanoSeconds
+			totalVoteNs += l.VoteRequestTimeNanoSeconds
+			userTimes = append(userTimes, l.UserRequestTimeNanoSeconds)
+			voteTimes = append(voteTimes, l.VoteRequestTimeNanoSeconds)
 		}
+
+		// compute percentiles
+		sort.Slice(userTimes, func(i, j int) bool { return userTimes[i] < userTimes[j] })
+		sort.Slice(voteTimes, func(i, j int) bool { return voteTimes[i] < voteTimes[j] })
+
+		p := func(arr []int64, pct float64) int64 {
+			idx := int(float64(len(arr)-1) * pct)
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= len(arr) {
+				idx = len(arr) - 1
+			}
+			return arr[idx]
+		}
+
+		log.Printf("=== SUMMARY ===")
+		log.Printf("Total votes: %d", len(logs))
+		log.Printf("Success: %d, Failures: %d", successCount, failureCount)
+		log.Printf("Avg user request (ms): %.2f", float64(totalUserNs)/1e6/float64(len(logs)))
+		log.Printf("Avg vote request (ms): %.2f", float64(totalVoteNs)/1e6/float64(len(logs)))
+		log.Printf("User P50/P90/P99 (ms): %v / %v / %v", p(userTimes, 0.50)/1e6, p(userTimes, 0.90)/1e6, p(userTimes, 0.99)/1e6)
+		log.Printf("Vote P50/P90/P99 (ms): %v / %v / %v", p(voteTimes, 0.50)/1e6, p(voteTimes, 0.90)/1e6, p(voteTimes, 0.99)/1e6)
 	}
 }
